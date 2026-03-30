@@ -1,0 +1,6 @@
+{
+  "latest_sequence_date": "2026-02-20 00:00:00",
+  "pred_price_change_t1": -1.7665736675262451,
+  "pred_stock_change_t1": -4905.25732421875,
+  "model_package": "d:\\Projects\\oil_analysis\\ML\\outputs_lstm_wf\\final_package"
+}

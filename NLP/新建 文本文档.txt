@@ -1,0 +1,253 @@
+该代码已整理为可运行脚本：
+- 主程序：oil_price_nlp.py
+- 配置文件：config.json
+
+如需修改路径或参数，请编辑 config.json。
+import pandas as pd
+import numpy as np
+import jieba
+from gensim.models import Word2Vec
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+import matplotlib as mpl
+from matplotlib.font_manager import FontProperties
+
+# 1. 解决中文字体问题
+def set_chinese_font():
+    """尝试设置中文字体支持"""
+    try:
+        # 尝试使用系统自带的中文字体
+        font_path = None
+        
+        # Windows系统常见中文字体路径
+        windows_fonts = [
+            'C:/Windows/Fonts/simhei.ttf',  # 黑体
+            'C:/Windows/Fonts/msyh.ttc',    # 微软雅黑
+            'C:/Windows/Fonts/simkai.ttf',  # 楷体
+            'C:/Windows/Fonts/simsun.ttc', # 宋体
+        ]
+        
+        # 检查是否存在可用的中文字体
+        for font in windows_fonts:
+            if os.path.exists(font):
+                font_path = font
+                break
+        
+        if font_path:
+            # 创建字体属性
+            chinese_font = FontProperties(fname=font_path)
+            # 设置全局字体
+            plt.rcParams['font.family'] = chinese_font.get_name()
+            plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+            print(f"已设置中文字体: {chinese_font.get_name()}")
+            return chinese_font
+        else:
+            print("警告: 未找到系统中文字体，将使用英文标签")
+            return None
+    except Exception as e:
+        print(f"字体设置错误: {e}")
+        return None
+
+# 设置中文字体
+chinese_font = set_chinese_font()
+
+# 2. 读取数据
+data_path = "C:\\Users\\23176\\Desktop\\油价模型\\data.xlsx"
+if not os.path.exists(data_path):
+    print(f"错误: 数据文件不存在 - {data_path}")
+    exit()
+    
+df = pd.read_excel(data_path)
+
+# 3. 文本预处理和分词
+def preprocess_text(text):
+    """中文文本预处理和分词"""
+    # 去除特殊字符和标点
+    text = str(text).replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+    # 使用jieba进行分词
+    words = jieba.lcut(text)
+    # 移除停用词和单字词
+    filtered_words = [word for word in words if len(word) > 1]
+    return filtered_words
+
+# 对事件描述进行分词
+df['Tokenized'] = df['Event_Description'].apply(preprocess_text)
+
+# 4. 训练Word2Vec模型
+sentences = df['Tokenized'].tolist()
+
+# 创建Word2Vec模型
+model = Word2Vec(
+    sentences=sentences,
+    vector_size=100,  # 词向量维度
+    window=5,        # 上下文窗口大小
+    min_count=3,     # 忽略出现次数少于3次的词
+    workers=4,       # 使用4个线程
+    epochs=50        # 训练迭代次数
+)
+
+# 保存模型
+model_path = "C:\\Users\\23176\\Desktop\\油价模型\\oil_price_word2vec.model"
+model.save(model_path)
+print(f"Word2Vec模型已保存至: {model_path}")
+
+# 5. 将事件描述转化为向量
+def text_to_vector(tokens):
+    """将分词后的文本转化为向量（取所有词向量的平均值）"""
+    vectors = []
+    for token in tokens:
+        if token in model.wv:
+            vectors.append(model.wv[token])
+    if vectors:
+        return np.mean(vectors, axis=0)
+    else:
+        return np.zeros(model.vector_size)
+
+# 创建向量表示
+df['Text_Vector'] = df['Tokenized'].apply(text_to_vector)
+
+# 6. 可视化词向量（使用PCA降维）
+def visualize_word_vectors(words, model, font_prop=None):
+    """可视化关键词的词向量"""
+    vectors = []
+    labels = []
+    for word in words:
+        if word in model.wv:
+            vectors.append(model.wv[word])
+            labels.append(word)
+    
+    if not vectors:
+        print("没有找到关键词的向量表示")
+        return
+    
+    # 使用PCA降维到2D
+    pca = PCA(n_components=2)
+    vectors_2d = pca.fit_transform(vectors)
+    
+    # 绘制散点图
+    plt.figure(figsize=(12, 8))
+    plt.scatter(vectors_2d[:, 0], vectors_2d[:, 1])
+    
+    # 添加标签 - 使用字体属性如果可用
+    for i, label in enumerate(labels):
+        if font_prop:
+            plt.annotate(label, (vectors_2d[i, 0], vectors_2d[i, 1]), fontproperties=font_prop)
+        else:
+            plt.annotate(label, (vectors_2d[i, 0], vectors_2d[i, 1]))
+    
+    plt.title("关键词向量可视化", fontproperties=font_prop)
+    plt.xlabel("PCA 1", fontproperties=font_prop)
+    plt.ylabel("PCA 2", fontproperties=font_prop)
+    
+    # 保存图像
+    plt.savefig("C:\\Users\\23176\\Desktop\\油价模型\\word_vectors.png")
+    plt.show()
+
+# 可视化一些关键词
+keywords = ["减产", "制裁", "库存", "战争", "协议", "价格", "需求", "供应", "OPEC", "俄罗斯", "美国", "伊朗"]
+visualize_word_vectors(keywords, model, chinese_font)
+
+# 7. 将向量数据保存到新文件
+# 创建包含向量数据的DataFrame
+vector_df = pd.DataFrame(df['Text_Vector'].tolist(), 
+                         columns=[f"Vec_{i}" for i in range(model.vector_size)])
+
+# 合并原始数据和向量数据
+final_df = pd.concat([df.drop(columns=['Tokenized', 'Text_Vector']), vector_df], axis=1)
+
+# 保存到新文件
+output_path = "C:\\Users\\23176\\Desktop\\油价模型\\oil_data_with_vectors.xlsx"
+final_df.to_excel(output_path, index=False)
+print(f"数据已保存至: {output_path}")
+
+# 8. 分析向量与油价变动的关系
+# 计算向量与Change的相关性
+if 'Change' in final_df.columns:
+    correlations = []
+    for i in range(model.vector_size):
+        corr = np.corrcoef(final_df[f"Vec_{i}"], final_df['Change'])[0, 1]
+        correlations.append(corr)
+
+    # 绘制相关性热力图
+    plt.figure(figsize=(15, 6))
+    sns.heatmap([correlations], annot=False, cmap='coolwarm', 
+                cbar_kws={'label': '与价格变动的相关性'})
+    
+    # 设置标题（如果字体可用）
+    if chinese_font:
+        plt.title("词向量维度与油价变动的相关性", fontproperties=chinese_font)
+    else:
+        plt.title("Correlation between Vector Dimensions and Price Change")
+    
+    plt.xlabel("向量维度")
+    plt.ylabel("")
+    
+    # 保存图像
+    plt.savefig("C:\\Users\\23176\\Desktop\\油价模型\\vector_correlation.png")
+    plt.show()
+else:
+    print("警告: 数据中缺少'Change'列，无法计算相关性")
+
+# 9. 保存向量数据为CSV格式（便于后续分析）
+vector_df.to_csv("C:\\Users\\23176\\Desktop\\油价模型\\text_vectors.csv", index=False)
+print("文本向量已保存为CSV文件")
+
+# 10. 备选方案：使用英文标签保存图像
+if not chinese_font:
+    print("尝试使用英文标签重新保存图像...")
+    
+    # 重新可视化词向量（英文标签）
+    def visualize_word_vectors_english(words, model):
+        """可视化关键词的词向量（英文标签）"""
+        vectors = []
+        labels = []
+        for word in words:
+            if word in model.wv:
+                vectors.append(model.wv[word])
+                # 将中文关键词映射为英文
+                english_labels = {
+                    "减产": "Production_Cut",
+                    "制裁": "Sanction",
+                    "库存": "Inventory",
+                    "战争": "War",
+                    "协议": "Agreement",
+                    "价格": "Price",
+                    "需求": "Demand",
+                    "供应": "Supply",
+                    "OPEC": "OPEC",
+                    "俄罗斯": "Russia",
+                    "美国": "USA",
+                    "伊朗": "Iran"
+                }
+                labels.append(english_labels.get(word, word))
+        
+        if not vectors:
+            print("没有找到关键词的向量表示")
+            return
+        
+        # 使用PCA降维到2D
+        pca = PCA(n_components=2)
+        vectors_2d = pca.fit_transform(vectors)
+        
+        # 绘制散点图
+        plt.figure(figsize=(12, 8))
+        plt.scatter(vectors_2d[:, 0], vectors_2d[:, 1])
+        
+        # 添加标签
+        for i, label in enumerate(labels):
+            plt.annotate(label, (vectors_2d[i, 0], vectors_2d[i, 1]))
+        
+        plt.title("Keyword Vector Visualization")
+        plt.xlabel("PCA 1")
+        plt.ylabel("PCA 2")
+        
+        # 保存图像
+        plt.savefig("C:\\Users\\23176\\Desktop\\油价模型\\word_vectors_english.png")
+        plt.show()
+    
+    # 可视化一些关键词（英文标签）
+    visualize_word_vectors_english(keywords, model)
+    
+    print("英文标签图像已保存为 word_vectors_english.png")

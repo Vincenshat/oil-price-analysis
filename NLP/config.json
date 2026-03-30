@@ -1,0 +1,41 @@
+{
+  "paths": {
+    "data_file": "data.xlsx",
+    "output_dir": "outputs"
+  },
+  "columns": {
+    "text_column": "Event_Description",
+    "change_column": "Change"
+  },
+  "word2vec": {
+    "vector_size": 100,
+    "window": 5,
+    "min_count": 3,
+    "workers": 4,
+    "epochs": 50
+  },
+  "visualization": {
+    "keywords": [
+      "减产",
+      "制裁",
+      "库存",
+      "战争",
+      "协议",
+      "价格",
+      "需求",
+      "供应",
+      "OPEC",
+      "俄罗斯",
+      "美国",
+      "伊朗"
+    ]
+  },
+  "outputs": {
+    "model_file": "oil_price_word2vec.model",
+    "word_vectors_plot": "word_vectors.png",
+    "word_vectors_english_plot": "word_vectors_english.png",
+    "excel_with_vectors": "oil_data_with_vectors.xlsx",
+    "vectors_csv": "text_vectors.csv",
+    "correlation_plot": "vector_correlation.png"
+  }
+}

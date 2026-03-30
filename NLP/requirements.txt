@@ -1,0 +1,8 @@
+pandas
+numpy
+jieba
+gensim
+scikit-learn
+matplotlib
+seaborn
+openpyxl

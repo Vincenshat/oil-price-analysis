@@ -1,0 +1,62 @@
+{
+  "n_sequences": 258,
+  "n_folds": 4,
+  "val_size": 20,
+  "test_size": 20,
+  "fold_metrics_mean": {
+    "price_change_t1_mae": 3.164182722568512,
+    "price_change_t1_rmse": 3.5123501424409223,
+    "price_change_t1_r2": -0.06430408358573914,
+    "stock_change_t1_mae": 6312.0244140625,
+    "stock_change_t1_rmse": 7647.9643924446955,
+    "stock_change_t1_r2": -0.5784344673156738
+  },
+  "fold_metrics_std": {
+    "price_change_t1_mae": 0.8032320644566278,
+    "price_change_t1_rmse": 0.7571717787766576,
+    "price_change_t1_r2": 0.030407852027445066,
+    "stock_change_t1_mae": 2028.6030502465003,
+    "stock_change_t1_rmse": 2320.3755879592873,
+    "stock_change_t1_r2": 0.5602245143322652
+  },
+  "trial_count": 10,
+  "global_best_trial": {
+    "trial_id": 7,
+    "params": "{\"batch_size\": 24, \"dropout\": 0.3, \"hidden_size\": 96, \"learning_rate\": 0.0006, \"num_layers\": 3, \"weight_decay\": 0.0003}",
+    "mean_selection_score": 4.738922069231669,
+    "std_selection_score": 1.0004750353151581,
+    "mean_val_price_mae": 3.011816620826721,
+    "mean_val_stock_mae": 5181.316345214844,
+    "mean_test_price_mae": 3.124800682067871,
+    "mean_test_stock_mae": 6353.6529541015625
+  },
+  "final_package": {
+    "best_params": {
+      "batch_size": 24,
+      "dropout": 0.3,
+      "hidden_size": 96,
+      "learning_rate": 0.0006,
+      "num_layers": 3,
+      "weight_decay": 0.0003
+    },
+    "fit_samples": 218,
+    "val_samples": 20,
+    "holdout_samples": 20,
+    "holdout_metrics": {
+      "price_change_t1_mae": 3.0960116386413574,
+      "price_change_t1_rmse": 3.633044294940405,
+      "price_change_t1_r2": -1.8950166702270508,
+      "stock_change_t1_mae": 8987.453125,
+      "stock_change_t1_rmse": 10462.088510426587,
+      "stock_change_t1_r2": -0.05870640277862549
+    }
+  },
+  "process_plots": [
+    "process_flow.png",
+    "walkforward_splits.png",
+    "fold_metrics.png",
+    "last_fold_predictions.png",
+    "feature_selection_top20.png",
+    "residual_distribution.png"
+  ]
+}

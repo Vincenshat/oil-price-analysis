@@ -1,0 +1,21 @@
+{
+  "best_params": {
+    "batch_size": 24,
+    "dropout": 0.3,
+    "hidden_size": 96,
+    "learning_rate": 0.0006,
+    "num_layers": 3,
+    "weight_decay": 0.0003
+  },
+  "fit_samples": 218,
+  "val_samples": 20,
+  "holdout_samples": 20,
+  "holdout_metrics": {
+    "price_change_t1_mae": 3.0960116386413574,
+    "price_change_t1_rmse": 3.633044294940405,
+    "price_change_t1_r2": -1.8950166702270508,
+    "stock_change_t1_mae": 8987.453125,
+    "stock_change_t1_rmse": 10462.088510426587,
+    "stock_change_t1_r2": -0.05870640277862549
+  }
+}
