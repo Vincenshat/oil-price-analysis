@@ -1,6 +1,10 @@
 {
   "latest_sequence_date": "2026-02-20 00:00:00",
-  "pred_price_change_t1": -1.7665736675262451,
-  "pred_stock_change_t1": -4905.25732421875,
+  "latest_wti_price": 63.05,
+  "latest_stock_barrels": 1254773.0,
+  "latest_stock_change": 11179.0,
+  "latest_price_change": 3.64,
+  "pred_price_change_t1": 1.1038311721767968,
+  "pred_wti_price_t1": 64.1538311721768,
   "model_package": "d:\\Projects\\oil_analysis\\ML\\outputs_lstm_wf\\final_package"
 }

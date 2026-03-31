@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset
@@ -34,6 +35,10 @@ class Config:
     n_folds: int = 4
     val_size: int = 20
     test_size: int = 20
+    search_rounds: int = 2
+    trials_per_round: int = 50
+    ensemble_top_n: int = 5
+    recent_tune_window: int = 96
 
 
 class SequenceDataset(Dataset):
@@ -49,40 +54,49 @@ class SequenceDataset(Dataset):
 
 
 class LSTMRegressor(nn.Module):
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int, dropout: float):
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int, dropout: float, model_type: str = "lstm"):
         super().__init__()
-        self.lstm = nn.LSTM(
+        model_type = str(model_type).lower()
+        if model_type not in {"lstm", "gru"}:
+            raise ValueError(f"Unsupported model_type: {model_type}")
+        rnn_cls = nn.LSTM if model_type == "lstm" else nn.GRU
+        self.rnn = rnn_cls(
             input_size=input_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=True,
+        )
+        self.attn = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1),
         )
         self.head = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
+            nn.Linear(hidden_size * 2, hidden_size),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_size // 2, 2),
+            nn.Linear(hidden_size, 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out, _ = self.lstm(x)
-        return self.head(out[:, -1, :])
+        out, _ = self.rnn(x)
+        attn_w = torch.softmax(self.attn(out).squeeze(-1), dim=1).unsqueeze(-1)
+        context = torch.sum(out * attn_w, dim=1)
+        return self.head(context)
 
 
 def evaluate_predictions(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-    out = {}
-    names = ["price_change_t1", "stock_change_t1"]
-    for i, n in enumerate(names):
-        yt = y_true[:, i]
-        yp = y_pred[:, i]
-        out[f"{n}_mae"] = float(mean_absolute_error(yt, yp))
-        out[f"{n}_rmse"] = float(np.sqrt(mean_squared_error(yt, yp)))
-        out[f"{n}_r2"] = float(r2_score(yt, yp))
-        # Directional hit rate is useful when absolute magnitude is noisy.
-        out[f"{n}_direction_acc"] = float(np.mean(np.sign(yt) == np.sign(yp)))
-        out[f"{n}_mean_error"] = float(np.mean(yp - yt))
-    return out
+    yt = np.asarray(y_true).reshape(-1)
+    yp = np.asarray(y_pred).reshape(-1)
+    return {
+        "price_change_t1_mae": float(mean_absolute_error(yt, yp)),
+        "price_change_t1_rmse": float(np.sqrt(mean_squared_error(yt, yp))),
+        "price_change_t1_r2": float(r2_score(yt, yp)),
+        "price_change_t1_direction_acc": float(np.mean(np.sign(yt) == np.sign(yp))),
+        "price_change_t1_mean_error": float(np.mean(yp - yt)),
+    }
 
 
 def build_weekly_table(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
@@ -92,21 +106,10 @@ def build_weekly_table(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     df = df[df["WTI_T"].notna() & df["Stock_T"].notna() & df["Price_Change"].notna() & df["Stock_Change"].notna()]
     df = df[df["Price_Change"].abs() <= cfg.clip_price_change_abs]
 
-    macro_cols = [
-        "dxy_broad",
-        "us10y_yield",
-        "fed_funds_rate",
-        "cpi_aucsl",
-        "refinery_utilization_pct",
-        "oil_gas_extraction_ip",
-        "drilling_activity_ip",
-    ]
-    base_num_cols = ["WTI_T", "Stock_T", "Price_Level", "Price_Change", "Stock_Change"] + macro_cols
+    # Focus features strictly on oil inventory and oil price behavior.
+    base_num_cols = ["WTI_T", "Stock_T", "Price_Change", "Stock_Change"]
     for col in base_num_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    evt = pd.crosstab(df["Event_Date"], df["Event_Type"]).reset_index().rename_axis(None, axis=1)
-    evt.columns = ["Event_Date"] + [f"evt_cnt_{c}" for c in evt.columns[1:]]
 
     weekly = (
         df.groupby("Event_Date", as_index=False)
@@ -114,63 +117,49 @@ def build_weekly_table(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
             {
                 "WTI_T": "mean",
                 "Stock_T": "mean",
-                "Price_Level": "mean",
                 "Price_Change": "mean",
                 "Stock_Change": "mean",
-                "dxy_broad": "mean",
-                "us10y_yield": "mean",
-                "fed_funds_rate": "mean",
-                "cpi_aucsl": "mean",
-                "refinery_utilization_pct": "mean",
-                "oil_gas_extraction_ip": "mean",
-                "drilling_activity_ip": "mean",
             }
         )
         .sort_values("Event_Date")
     )
-    weekly = weekly.merge(evt, on="Event_Date", how="left")
 
     full_idx = pd.date_range(weekly["Event_Date"].min(), weekly["Event_Date"].max(), freq="W-FRI")
     weekly = weekly.set_index("Event_Date").reindex(full_idx).rename_axis("Event_Date").reset_index()
-
-    evt_cols = [c for c in weekly.columns if c.startswith("evt_cnt_")]
-    for c in evt_cols:
-        weekly[c] = weekly[c].fillna(0.0)
 
     num_cols = [c for c in weekly.columns if c != "Event_Date"]
     # Leakage-safe fill: only forward fill, never backward fill from future.
     weekly[num_cols] = weekly[num_cols].ffill()
 
-    weekly["week_of_year"] = weekly["Event_Date"].dt.isocalendar().week.astype(float)
-    weekly["month"] = weekly["Event_Date"].dt.month.astype(float)
-    weekly["week_sin"] = np.sin(2 * np.pi * weekly["week_of_year"] / 52.0)
-    weekly["week_cos"] = np.cos(2 * np.pi * weekly["week_of_year"] / 52.0)
-    weekly["month_sin"] = np.sin(2 * np.pi * weekly["month"] / 12.0)
-    weekly["month_cos"] = np.cos(2 * np.pi * weekly["month"] / 12.0)
-
-    lag_cols = ["WTI_T", "Stock_T", "Price_Change", "Stock_Change", "dxy_broad", "us10y_yield", "fed_funds_rate"]
+    lag_cols = ["WTI_T", "Stock_T", "Price_Change", "Stock_Change"]
     for col in lag_cols:
-        for lag in [1, 2, 4]:
+        for lag in [1, 2, 3, 4, 6, 8]:
             weekly[f"{col}_lag{lag}"] = weekly[col].shift(lag)
 
     for col in ["WTI_T", "Stock_T", "Price_Change", "Stock_Change"]:
         weekly[f"{col}_roll3_mean"] = weekly[col].rolling(3, min_periods=2).mean()
         weekly[f"{col}_roll6_mean"] = weekly[col].rolling(6, min_periods=3).mean()
+        weekly[f"{col}_roll12_mean"] = weekly[col].rolling(12, min_periods=6).mean()
+        weekly[f"{col}_roll3_std"] = weekly[col].rolling(3, min_periods=2).std()
         weekly[f"{col}_roll6_std"] = weekly[col].rolling(6, min_periods=3).std()
+        weekly[f"{col}_roll12_std"] = weekly[col].rolling(12, min_periods=6).std()
 
-    chg_cols = [
-        "WTI_T",
-        "Stock_T",
-        "dxy_broad",
-        "us10y_yield",
-        "fed_funds_rate",
-        "refinery_utilization_pct",
-        "oil_gas_extraction_ip",
-        "drilling_activity_ip",
-    ]
+    chg_cols = ["WTI_T", "Stock_T", "Price_Change", "Stock_Change"]
     for col in chg_cols:
         weekly[f"{col}_diff1"] = weekly[col].diff(1)
+        weekly[f"{col}_diff2"] = weekly[col].diff(2)
         weekly[f"{col}_pct1"] = weekly[col].pct_change(1)
+        weekly[f"{col}_pct2"] = weekly[col].pct_change(2)
+
+    # Inventory-price relationship features.
+    weekly["inv_price_spread"] = weekly["Stock_Change"] - weekly["Price_Change"]
+    weekly["inv_price_product"] = weekly["Stock_Change"] * weekly["Price_Change"]
+    weekly["inv_to_price_ratio"] = weekly["Stock_Change"] / (weekly["Price_Change"].abs() + 1.0)
+    weekly["price_to_inv_ratio"] = weekly["Price_Change"] / (weekly["Stock_Change"].abs() + 1.0)
+    weekly["inv_abs"] = weekly["Stock_Change"].abs()
+    weekly["price_abs"] = weekly["Price_Change"].abs()
+    weekly["inv_momentum_3"] = weekly["Stock_Change"] - weekly["Stock_Change"].shift(3)
+    weekly["price_momentum_3"] = weekly["Price_Change"] - weekly["Price_Change"].shift(3)
 
     weekly = weekly.replace([np.inf, -np.inf], np.nan)
     num_cols = [c for c in weekly.columns if c != "Event_Date"]
@@ -178,17 +167,17 @@ def build_weekly_table(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     weekly[num_cols] = weekly[num_cols].ffill()
     # For engineered columns that are undefined at the beginning, use 0 instead of future info.
     weekly[num_cols] = weekly[num_cols].fillna(0.0)
+    weekly = weekly.copy()
 
     weekly["target_price_change_t1"] = weekly["Price_Change"].shift(-1)
-    weekly["target_stock_change_t1"] = weekly["Stock_Change"].shift(-1)
-    weekly = weekly.dropna(subset=["target_price_change_t1", "target_stock_change_t1"]).reset_index(drop=True)
+    weekly = weekly.dropna(subset=["target_price_change_t1"]).reset_index(drop=True)
     return weekly
 
 
 def build_sequences(weekly: pd.DataFrame, lookback: int) -> Tuple[np.ndarray, np.ndarray, List[pd.Timestamp], List[str]]:
-    feature_cols = [c for c in weekly.columns if c not in ["Event_Date", "target_price_change_t1", "target_stock_change_t1"]]
+    feature_cols = [c for c in weekly.columns if c not in ["Event_Date", "target_price_change_t1"]]
     Xv = weekly[feature_cols].values.astype(np.float32)
-    yv = weekly[["target_price_change_t1", "target_stock_change_t1"]].values.astype(np.float32)
+    yv = weekly["target_price_change_t1"].values.astype(np.float32).reshape(-1, 1)
     dates = weekly["Event_Date"].tolist()
     X_seq, y_seq, y_dates = [], [], []
     for i in range(lookback - 1, len(weekly)):
@@ -233,8 +222,7 @@ def select_feature_indices(X_train: np.ndarray, y_train: np.ndarray, top_k: int,
         if not valid[i]:
             continue
         c1 = np.corrcoef(x_last[:, i], y_train[:, 0])[0, 1]
-        c2 = np.corrcoef(x_last[:, i], y_train[:, 1])[0, 1]
-        val = np.nanmax([abs(c1), abs(c2)])
+        val = abs(c1)
         rel[i] = 0.0 if np.isnan(val) else float(val)
     ranked = [i for i in np.argsort(-rel) if valid[i]]
     selected: List[int] = []
@@ -279,8 +267,18 @@ def train_one_trial(
     train_loader = DataLoader(SequenceDataset(X_train_s, y_train_s), batch_size=int(trial["batch_size"]), shuffle=True)
     val_loader = DataLoader(SequenceDataset(X_val_s, y_val_s), batch_size=int(trial["batch_size"]), shuffle=False)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = LSTMRegressor(X_train_s.shape[-1], int(trial["hidden_size"]), int(trial["num_layers"]), float(trial["dropout"])).to(device)
-    criterion = nn.MSELoss()
+    model = LSTMRegressor(
+        X_train_s.shape[-1],
+        int(trial["hidden_size"]),
+        int(trial["num_layers"]),
+        float(trial["dropout"]),
+        str(trial.get("model_type", "lstm")),
+    ).to(device)
+    loss_type = str(trial.get("loss_type", "mse")).lower()
+    if loss_type == "huber":
+        criterion = nn.SmoothL1Loss(beta=float(trial.get("huber_delta", 1.0)))
+    else:
+        criterion = nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(trial["learning_rate"]), weight_decay=float(trial["weight_decay"]))
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5, min_lr=1e-5)
 
@@ -324,7 +322,7 @@ def train_one_trial(
     model.load_state_dict(best_state)
 
     def _pred(x_arr: np.ndarray) -> np.ndarray:
-        loader = DataLoader(SequenceDataset(x_arr, np.zeros((len(x_arr), 2), dtype=np.float32)), batch_size=64, shuffle=False)
+        loader = DataLoader(SequenceDataset(x_arr, np.zeros((len(x_arr), 1), dtype=np.float32)), batch_size=64, shuffle=False)
         outs = []
         model.eval()
         with torch.no_grad():
@@ -343,10 +341,52 @@ def train_one_trial(
     }
 
 
+def sample_trial_grid(cfg: Config, round_idx: int) -> List[Dict[str, float]]:
+    rng = np.random.default_rng(SEED + 97 * (round_idx + 1))
+    grid: List[Dict[str, float]] = []
+    anchor_trials = [
+        {"model_type": "lstm", "hidden_size": 64, "num_layers": 2, "dropout": 0.10, "learning_rate": 1.2e-3, "weight_decay": 1e-4, "batch_size": 32, "loss_type": "mse", "huber_delta": 1.0},
+        {"model_type": "lstm", "hidden_size": 64, "num_layers": 2, "dropout": 0.15, "learning_rate": 1.0e-3, "weight_decay": 8e-5, "batch_size": 32, "loss_type": "mse", "huber_delta": 1.0},
+        {"model_type": "lstm", "hidden_size": 80, "num_layers": 2, "dropout": 0.12, "learning_rate": 9e-4, "weight_decay": 1.2e-4, "batch_size": 24, "loss_type": "mse", "huber_delta": 1.0},
+        {"model_type": "lstm", "hidden_size": 96, "num_layers": 2, "dropout": 0.16, "learning_rate": 8e-4, "weight_decay": 1.5e-4, "batch_size": 24, "loss_type": "huber", "huber_delta": 1.2},
+        {"model_type": "gru", "hidden_size": 64, "num_layers": 2, "dropout": 0.10, "learning_rate": 1.0e-3, "weight_decay": 1e-4, "batch_size": 32, "loss_type": "mse", "huber_delta": 1.0},
+        {"model_type": "gru", "hidden_size": 80, "num_layers": 2, "dropout": 0.15, "learning_rate": 8.5e-4, "weight_decay": 1.2e-4, "batch_size": 24, "loss_type": "huber", "huber_delta": 1.0},
+    ]
+    for t in anchor_trials:
+        grid.append(dict(t))
+
+    remaining = max(0, cfg.trials_per_round - len(grid))
+    for _ in range(remaining):
+        model_type = str(rng.choice(["lstm", "gru"]))
+        loss_type = str(rng.choice(["mse", "huber"]))
+        lr = float(np.exp(rng.uniform(np.log(4e-4), np.log(1.6e-3))))
+        wd = float(np.exp(rng.uniform(np.log(5e-6), np.log(3e-4))))
+        trial = {
+            "model_type": model_type,
+            "hidden_size": int(rng.choice([64, 80, 96, 128])),
+            "num_layers": int(rng.choice([1, 2, 3])),
+            "dropout": float(rng.uniform(0.06, 0.28)),
+            "learning_rate": lr,
+            "weight_decay": wd,
+            "batch_size": int(rng.choice([16, 24, 32])),
+            "loss_type": loss_type,
+            "huber_delta": float(rng.choice([0.8, 1.0, 1.2, 1.5])),
+        }
+        grid.append(trial)
+    return grid
+
+
 def plot_process_flow(out_dir: Path):
     plt.figure(figsize=(12, 2.8))
     plt.axis("off")
-    steps = ["Raw Table", "Interpolation + FE", "Sequence Build", "Walk-Forward Folds", "LSTM Tuning", "Fold Metrics + Plots"]
+    steps = [
+        "Raw Table",
+        "Stock/Price FE",
+        "Sequence Build",
+        "Walk-Forward Folds",
+        "BiLSTM+Attn Tuning",
+        "Metrics + Evaluation Plots",
+    ]
     xs = np.linspace(0.05, 0.95, len(steps))
     for i, (x, s) in enumerate(zip(xs, steps)):
         plt.text(x, 0.5, s, ha="center", va="center", fontsize=10, bbox=dict(boxstyle="round,pad=0.4", facecolor="#dbeafe", edgecolor="#2563eb"))
@@ -377,17 +417,15 @@ def plot_splits(out_dir: Path, splits: List[Dict[str, int]], n: int):
 
 def plot_fold_metrics(out_dir: Path, folds_df: pd.DataFrame):
     x = folds_df["fold"].values
-    plt.figure(figsize=(11, 4))
+    plt.figure(figsize=(10, 4))
     plt.subplot(1, 2, 1)
-    plt.plot(x, folds_df["price_change_t1_mae"], marker="o", label="price MAE")
-    plt.plot(x, folds_df["stock_change_t1_mae"], marker="o", label="stock MAE")
-    plt.title("MAE by Fold")
+    plt.plot(x, folds_df["price_change_t1_mae"], marker="o", label="price MAE", color="#2563eb")
+    plt.title("Price MAE by Fold")
     plt.xlabel("Fold")
     plt.legend()
     plt.subplot(1, 2, 2)
-    plt.plot(x, folds_df["price_change_t1_r2"], marker="o", label="price R2")
-    plt.plot(x, folds_df["stock_change_t1_r2"], marker="o", label="stock R2")
-    plt.title("R2 by Fold")
+    plt.plot(x, folds_df["price_change_t1_r2"], marker="o", label="price R2", color="#16a34a")
+    plt.title("Price R2 by Fold")
     plt.xlabel("Fold")
     plt.legend()
     plt.tight_layout()
@@ -396,17 +434,10 @@ def plot_fold_metrics(out_dir: Path, folds_df: pd.DataFrame):
 
 
 def plot_last_fold_predictions(out_dir: Path, pred_df: pd.DataFrame):
-    plt.figure(figsize=(11, 4))
-    plt.subplot(1, 2, 1)
+    plt.figure(figsize=(10, 4))
     plt.plot(pred_df["Event_Date"], pred_df["y_true_price_change_t1"], label="true")
     plt.plot(pred_df["Event_Date"], pred_df["y_pred_price_change_t1"], label="pred")
     plt.title("Last Fold PriceChange t+1")
-    plt.xticks(rotation=35)
-    plt.legend()
-    plt.subplot(1, 2, 2)
-    plt.plot(pred_df["Event_Date"], pred_df["y_true_stock_change_t1"], label="true")
-    plt.plot(pred_df["Event_Date"], pred_df["y_pred_stock_change_t1"], label="pred")
-    plt.title("Last Fold StockChange t+1")
     plt.xticks(rotation=35)
     plt.legend()
     plt.tight_layout()
@@ -414,29 +445,107 @@ def plot_last_fold_predictions(out_dir: Path, pred_df: pd.DataFrame):
     plt.close()
 
 
-def plot_feature_frequency(out_dir: Path, feature_freq: pd.DataFrame):
-    top = feature_freq.head(20).iloc[::-1]
-    plt.figure(figsize=(9, 6))
-    plt.barh(top["feature"], top["selected_in_folds"], color="#3b82f6")
-    plt.title("Top20 Feature Selection Frequency")
-    plt.xlabel("Selected In Folds")
+def plot_residual_distribution(out_dir: Path, pred_df: pd.DataFrame):
+    rp = pred_df["y_true_price_change_t1"] - pred_df["y_pred_price_change_t1"]
+    plt.figure(figsize=(8, 4))
+    plt.hist(rp, bins=15, color="#60a5fa", edgecolor="white")
+    plt.title("Residual Distribution: PriceChange")
     plt.tight_layout()
-    plt.savefig(out_dir / "feature_selection_top20.png", dpi=160)
+    plt.savefig(out_dir / "residual_distribution.png", dpi=160)
     plt.close()
 
 
-def plot_residual_distribution(out_dir: Path, pred_df: pd.DataFrame):
-    rp = pred_df["y_true_price_change_t1"] - pred_df["y_pred_price_change_t1"]
-    rs = pred_df["y_true_stock_change_t1"] - pred_df["y_pred_stock_change_t1"]
+def plot_training_overview(out_dir: Path, n_folds: int):
+    hist_files = [out_dir / f"fold_{i}_history.csv" for i in range(1, n_folds + 1)]
+    hist_files = [p for p in hist_files if p.exists()]
+    if not hist_files:
+        return
+    plt.figure(figsize=(11, 4))
+    plt.subplot(1, 2, 1)
+    best_vals = []
+    fold_ids = []
+    for p in hist_files:
+        fold_id = int(p.stem.split("_")[1])
+        h = pd.read_csv(p, encoding="utf-8-sig")
+        plt.plot(h["epoch"], h["val_loss"], alpha=0.8, label=f"fold{fold_id} val")
+        best_vals.append(float(h["val_loss"].min()))
+        fold_ids.append(fold_id)
+    plt.title("Validation Loss Curves by Fold")
+    plt.xlabel("Epoch")
+    plt.ylabel("Val Loss")
+    plt.legend(fontsize=8, ncol=2)
+    plt.subplot(1, 2, 2)
+    plt.bar(fold_ids, best_vals, color="#2563eb")
+    plt.title("Best Validation Loss per Fold")
+    plt.xlabel("Fold")
+    plt.ylabel("Best Val Loss")
+    plt.tight_layout()
+    plt.savefig(out_dir / "training_overview.png", dpi=160)
+    plt.close()
+
+
+def plot_actual_vs_pred_scatter(out_dir: Path, pred_df: pd.DataFrame):
+    plt.figure(figsize=(6, 5))
+    yt = pred_df["y_true_price_change_t1"].values
+    yp = pred_df["y_pred_price_change_t1"].values
+    mn = min(float(np.min(yt)), float(np.min(yp)))
+    mx = max(float(np.max(yt)), float(np.max(yp)))
+    plt.scatter(yt, yp, alpha=0.7, color="#2563eb")
+    plt.plot([mn, mx], [mn, mx], "k--", linewidth=1)
+    plt.title("PriceChange: True vs Pred")
+    plt.xlabel("True")
+    plt.ylabel("Pred")
+    plt.tight_layout()
+    plt.savefig(out_dir / "actual_vs_pred_scatter.png", dpi=160)
+    plt.close()
+
+
+def plot_residual_timeseries(out_dir: Path, pred_df: pd.DataFrame):
+    d = pred_df.copy()
+    d["Event_Date"] = pd.to_datetime(d["Event_Date"], errors="coerce")
+    d["price_resid"] = d["y_true_price_change_t1"] - d["y_pred_price_change_t1"]
+    plt.figure(figsize=(10, 4))
+    plt.plot(d["Event_Date"], d["price_resid"], marker="o", color="#2563eb")
+    plt.axhline(0.0, color="black", linewidth=1, linestyle="--")
+    plt.xticks(rotation=35)
+    plt.title("Residual Over Time: PriceChange")
+    plt.tight_layout()
+    plt.savefig(out_dir / "residual_timeseries.png", dpi=160)
+    plt.close()
+
+
+def plot_inventory_price_focus(out_dir: Path, weekly: pd.DataFrame):
+    d = weekly.copy()
     plt.figure(figsize=(10, 4))
     plt.subplot(1, 2, 1)
-    plt.hist(rp, bins=15, color="#60a5fa", edgecolor="white")
-    plt.title("Residual Distribution: PriceChange")
+    plt.scatter(d["Stock_Change"], d["Price_Change"], alpha=0.5, color="#7c3aed")
+    c = np.corrcoef(d["Stock_Change"].values, d["Price_Change"].values)[0, 1]
+    c = 0.0 if np.isnan(c) else float(c)
+    plt.title(f"StockChange vs PriceChange (corr={c:.3f})")
+    plt.xlabel("Stock_Change")
+    plt.ylabel("Price_Change")
     plt.subplot(1, 2, 2)
-    plt.hist(rs, bins=15, color="#34d399", edgecolor="white")
-    plt.title("Residual Distribution: StockChange")
+    lag_vals = []
+    lag_idx = list(range(0, 9))
+    px = d["Price_Change"].values
+    st = d["Stock_Change"].values
+    for lag in lag_idx:
+        if lag == 0:
+            a, b = st, px
+        else:
+            a, b = st[:-lag], px[lag:]
+        if len(a) < 5:
+            lag_vals.append(0.0)
+        else:
+            cc = np.corrcoef(a, b)[0, 1]
+            lag_vals.append(0.0 if np.isnan(cc) else float(cc))
+    plt.plot(lag_idx, lag_vals, marker="o", color="#7c3aed")
+    plt.axhline(0.0, color="black", linestyle="--", linewidth=1)
+    plt.title("Lag Correlation: Stock(t) -> Price(t+lag)")
+    plt.xlabel("Lag (weeks)")
+    plt.ylabel("Correlation")
     plt.tight_layout()
-    plt.savefig(out_dir / "residual_distribution.png", dpi=160)
+    plt.savefig(out_dir / "inventory_price_focus.png", dpi=160)
     plt.close()
 
 
@@ -447,7 +556,7 @@ def export_final_package(
     y: np.ndarray,
     y_dates: List[pd.Timestamp],
     feature_cols: List[str],
-    best_params: Dict[str, float],
+    best_params_list: List[Dict[str, float]],
 ):
     pkg_dir = out_dir / "final_package"
     pkg_dir.mkdir(parents=True, exist_ok=True)
@@ -468,41 +577,160 @@ def export_final_package(
     y_hold = y[train_all_end:]
     d_hold = y_dates[train_all_end:]
 
-    selected_idx = select_feature_indices(X_fit, y_fit, cfg.top_k_features, cfg.feature_corr_threshold)
-    selected_names = [feature_cols[i] for i in selected_idx]
-    X_fit = X_fit[:, :, selected_idx]
-    X_val = X_val[:, :, selected_idx]
-    X_hold = X_hold[:, :, selected_idx]
+    selected_names = feature_cols
 
     X_fit_s, X_val_s, X_hold_s, y_fit_s, y_val_s, y_hold_s, x_scaler, y_scaler = transform_by_train(
         X_fit, X_val, X_hold, y_fit, y_val, y_hold
     )
 
-    res = train_one_trial(X_fit_s, y_fit_s, X_val_s, y_val_s, cfg, best_params)
-    hold_pred_s = res["predict_func"](X_hold_s)
-    hold_pred = y_scaler.inverse_transform(hold_pred_s)
+    if not best_params_list:
+        raise ValueError("best_params_list is empty.")
+
+    model_payloads = []
+    hold_preds = []
+    val_preds = []
+    inv_losses = []
+    for i, params in enumerate(best_params_list, start=1):
+        res = train_one_trial(X_fit_s, y_fit_s, X_val_s, y_val_s, cfg, params)
+        val_pred_s_i = res["predict_func"](X_val_s)
+        val_pred_i = y_scaler.inverse_transform(val_pred_s_i)
+        hold_pred_s_i = res["predict_func"](X_hold_s)
+        hold_pred_i = y_scaler.inverse_transform(hold_pred_s_i)
+        val_preds.append(val_pred_i)
+        hold_preds.append(hold_pred_i)
+        val_true_i = y_scaler.inverse_transform(y_val_s)
+        mae_full = float(mean_absolute_error(val_true_i.reshape(-1), val_pred_i.reshape(-1)))
+        tail_n = min(8, len(val_true_i))
+        mae_tail = float(
+            mean_absolute_error(val_true_i.reshape(-1)[-tail_n:], val_pred_i.reshape(-1)[-tail_n:])
+        )
+        dyn_loss = 0.7 * mae_full + 0.3 * mae_tail
+        inv_losses.append(1.0 / (dyn_loss + 1e-8))
+        model_payloads.append(
+            {
+                "idx": i,
+                "params": params,
+                "val_loss": float(res["val_loss"]),
+                "val_mae_full": mae_full,
+                "val_mae_tail": mae_tail,
+                "history": res["history"],
+                "model_state": res["model_state"],
+            }
+        )
+
+    weights = np.array(inv_losses, dtype=float)
+    weights = weights / np.sum(weights)
+    val_pred_ens = np.zeros_like(val_preds[0])
+    hold_pred_ens = np.zeros_like(hold_preds[0])
+    for w, vp in zip(weights, val_preds):
+        val_pred_ens += float(w) * vp
+    for w, hp in zip(weights, hold_preds):
+        hold_pred_ens += float(w) * hp
     hold_true = y_scaler.inverse_transform(y_hold_s)
-    hold_metrics = evaluate_predictions(hold_true, hold_pred)
+    val_true = y_scaler.inverse_transform(y_val_s)
+
+    # Train a recent-window specialist and blend with ensemble by validation MAE.
+    recent_n = min(cfg.recent_tune_window, len(X_fit_s))
+    recent_start = max(0, len(X_fit_s) - recent_n)
+    X_recent = X_fit_s[recent_start:]
+    y_recent = y_fit_s[recent_start:]
+    recent_params = model_payloads[0]["params"]
+    recent_res = train_one_trial(X_recent, y_recent, X_val_s, y_val_s, cfg, recent_params)
+    val_pred_recent = y_scaler.inverse_transform(recent_res["predict_func"](X_val_s))
+    hold_pred_recent = y_scaler.inverse_transform(recent_res["predict_func"](X_hold_s))
+
+    best_alpha = 1.0
+    best_val_mae = float("inf")
+    val_blend_best = val_pred_ens
+    hold_blend_best = hold_pred_ens
+    for a in np.linspace(0.0, 1.0, 21):
+        vb = a * val_pred_ens + (1.0 - a) * val_pred_recent
+        mae = float(mean_absolute_error(val_true.reshape(-1), vb.reshape(-1)))
+        if mae < best_val_mae:
+            best_val_mae = mae
+            best_alpha = float(a)
+            val_blend_best = vb
+            hold_blend_best = a * hold_pred_ens + (1.0 - a) * hold_pred_recent
+
+    core_idx = {n: feature_cols.index(n) for n in ["WTI_T", "Stock_T", "Price_Change", "Stock_Change"]}
+    Xv_last = X_val[:, -1, :]
+    Xh_last = X_hold[:, -1, :]
+    corr_X_val = np.column_stack(
+        [
+            val_blend_best.reshape(-1),
+            Xv_last[:, core_idx["WTI_T"]],
+            Xv_last[:, core_idx["Stock_T"]],
+            Xv_last[:, core_idx["Price_Change"]],
+            Xv_last[:, core_idx["Stock_Change"]],
+        ]
+    )
+    corr_X_hold = np.column_stack(
+        [
+            hold_blend_best.reshape(-1),
+            Xh_last[:, core_idx["WTI_T"]],
+            Xh_last[:, core_idx["Stock_T"]],
+            Xh_last[:, core_idx["Price_Change"]],
+            Xh_last[:, core_idx["Stock_Change"]],
+        ]
+    )
+    corr_model = Ridge(alpha=1.0, random_state=SEED)
+    corr_model.fit(corr_X_val, val_true.reshape(-1))
+    hold_pred_corr = corr_model.predict(corr_X_hold).reshape(-1, 1)
+    hold_metrics = evaluate_predictions(hold_true, hold_pred_corr)
 
     pred_df = pd.DataFrame(
         {
             "Event_Date": d_hold,
-            "y_true_price_change_t1": hold_true[:, 0],
-            "y_pred_price_change_t1": hold_pred[:, 0],
-            "y_true_stock_change_t1": hold_true[:, 1],
-            "y_pred_stock_change_t1": hold_pred[:, 1],
+            "y_true_price_change_t1": hold_true.reshape(-1),
+            "y_pred_price_change_t1": hold_pred_corr.reshape(-1),
         }
     )
     pred_df.to_csv(pkg_dir / "final_holdout_predictions.csv", index=False, encoding="utf-8-sig")
-    pd.DataFrame(res["history"]).to_csv(pkg_dir / "final_train_history.csv", index=False, encoding="utf-8-sig")
-    torch.save(res["model_state"], pkg_dir / "final_lstm_model.pt")
+    # Keep compatibility by saving the first model as final_lstm_model.pt.
+    pd.DataFrame(model_payloads[0]["history"]).to_csv(pkg_dir / "final_train_history.csv", index=False, encoding="utf-8-sig")
+    torch.save(model_payloads[0]["model_state"], pkg_dir / "final_lstm_model.pt")
+    for mp in model_payloads:
+        torch.save(mp["model_state"], pkg_dir / f"final_lstm_model_{mp['idx']}.pt")
+    torch.save(recent_res["model_state"], pkg_dir / "final_recent_specialist_model.pt")
+    joblib.dump(corr_model, pkg_dir / "final_error_corrector.pkl")
     joblib.dump(x_scaler, pkg_dir / "final_x_scaler.pkl")
     joblib.dump(y_scaler, pkg_dir / "final_y_scaler.pkl")
     with open(pkg_dir / "final_feature_columns.json", "w", encoding="utf-8") as f:
         json.dump(selected_names, f, ensure_ascii=False, indent=2)
 
+    ensemble_models = []
+    for w, mp in zip(weights.tolist(), model_payloads):
+        ensemble_models.append(
+            {
+                "idx": mp["idx"],
+                "weight": float(w),
+                "val_loss": mp["val_loss"],
+                "val_mae_full": mp["val_mae_full"],
+                "val_mae_tail": mp["val_mae_tail"],
+                "params": mp["params"],
+                "model_file": f"final_lstm_model_{mp['idx']}.pt",
+            }
+        )
+
     final_info = {
-        "best_params": best_params,
+        "best_params": model_payloads[0]["params"],
+        "ensemble_size": len(model_payloads),
+        "ensemble_models": ensemble_models,
+        "error_corrector": {
+            "type": "ridge",
+            "alpha": 1.0,
+            "features": ["pred_raw", "WTI_T", "Stock_T", "Price_Change", "Stock_Change"],
+            "model_file": "final_error_corrector.pkl",
+        },
+        "recent_specialist": {
+            "enabled": True,
+            "recent_window": int(recent_n),
+            "blend_alpha_ensemble": float(best_alpha),
+            "blend_alpha_recent": float(1.0 - best_alpha),
+            "val_mae_after_blend": float(best_val_mae),
+            "params": recent_params,
+            "model_file": "final_recent_specialist_model.pt",
+        },
         "fit_samples": int(len(X_fit)),
         "val_samples": int(len(X_val)),
         "holdout_samples": int(len(X_hold)),
@@ -527,22 +755,11 @@ def main():
     plot_process_flow(out_dir)
     plot_splits(out_dir, splits, n)
 
-    trial_grid = [
-        {"hidden_size": 64, "num_layers": 2, "dropout": 0.15, "learning_rate": 1.2e-3, "weight_decay": 1e-4, "batch_size": 32},
-        {"hidden_size": 64, "num_layers": 2, "dropout": 0.25, "learning_rate": 8e-4, "weight_decay": 2e-4, "batch_size": 32},
-        {"hidden_size": 64, "num_layers": 3, "dropout": 0.2, "learning_rate": 8e-4, "weight_decay": 2e-4, "batch_size": 24},
-        {"hidden_size": 96, "num_layers": 2, "dropout": 0.2, "learning_rate": 1e-3, "weight_decay": 1e-4, "batch_size": 32},
-        {"hidden_size": 96, "num_layers": 2, "dropout": 0.25, "learning_rate": 8e-4, "weight_decay": 2e-4, "batch_size": 32},
-        {"hidden_size": 96, "num_layers": 3, "dropout": 0.25, "learning_rate": 7e-4, "weight_decay": 2e-4, "batch_size": 24},
-        {"hidden_size": 96, "num_layers": 3, "dropout": 0.3, "learning_rate": 6e-4, "weight_decay": 3e-4, "batch_size": 24},
-        {"hidden_size": 128, "num_layers": 2, "dropout": 0.25, "learning_rate": 8e-4, "weight_decay": 1e-4, "batch_size": 24},
-        {"hidden_size": 128, "num_layers": 2, "dropout": 0.3, "learning_rate": 6e-4, "weight_decay": 2e-4, "batch_size": 24},
-        {"hidden_size": 128, "num_layers": 3, "dropout": 0.3, "learning_rate": 5e-4, "weight_decay": 3e-4, "batch_size": 20},
-    ]
+    round_trial_grids = [sample_trial_grid(cfg, r) for r in range(cfg.search_rounds)]
+    trial_grid = [t for g in round_trial_grids for t in g]
 
     fold_rows = []
     all_trial_logs = []
-    feature_counter: Dict[str, int] = {}
     last_pred_df = None
     last_best_state = None
     last_scalers = None
@@ -559,20 +776,14 @@ def main():
         y_test = y[sp["test_start"] : sp["test_end"]]
         d_test = y_dates[sp["test_start"] : sp["test_end"]]
 
-        selected_idx = select_feature_indices(X_train, y_train, cfg.top_k_features, cfg.feature_corr_threshold)
-        selected_names = [feature_cols[i] for i in selected_idx]
-        for nname in selected_names:
-            feature_counter[nname] = feature_counter.get(nname, 0) + 1
-
-        X_train = X_train[:, :, selected_idx]
-        X_val = X_val[:, :, selected_idx]
-        X_test = X_test[:, :, selected_idx]
+        selected_names = feature_cols
         X_train_s, X_val_s, X_test_s, y_train_s, y_val_s, y_test_s, x_scaler, y_scaler = transform_by_train(
             X_train, X_val, X_test, y_train, y_val, y_test
         )
 
         best = None
         trial_logs = []
+        trial_pred_pool = []
         for tid, trial in enumerate(trial_grid, start=1):
             print(f"Fold {fold} Trial {tid}/{len(trial_grid)} {trial}")
             res = train_one_trial(X_train_s, y_train_s, X_val_s, y_val_s, cfg, trial)
@@ -582,7 +793,7 @@ def main():
             test_pred_tmp = y_scaler.inverse_transform(res["predict_func"](X_test_s))
             test_true_tmp = y_scaler.inverse_transform(y_test_s)
             test_metrics_tmp = evaluate_predictions(test_true_tmp, test_pred_tmp)
-            score = val_metrics["price_change_t1_mae"] + val_metrics["stock_change_t1_mae"] / 3000.0
+            score = val_metrics["price_change_t1_mae"]
             log = {
                 "fold": fold,
                 "trial_id": tid,
@@ -593,14 +804,26 @@ def main():
             }
             trial_logs.append(log)
             all_trial_logs.append(log)
+            trial_pred_pool.append(
+                {
+                    "trial_id": tid,
+                    "score": float(score),
+                    "test_pred": test_pred_tmp.reshape(-1),
+                }
+            )
             if best is None or score < best["selection_score"]:
                 best = {"trial_id": tid, "result": res, "selection_score": float(score), "val_metrics": val_metrics}
 
         if best is None:
             raise RuntimeError("No best trial found.")
 
-        pred_test_s = best["result"]["predict_func"](X_test_s)
-        pred_test = y_scaler.inverse_transform(pred_test_s)
+        top_preds = sorted(trial_pred_pool, key=lambda z: z["score"])[: max(1, min(cfg.ensemble_top_n, len(trial_pred_pool)))]
+        ens_w = np.array([1.0 / (x["score"] + 1e-8) for x in top_preds], dtype=float)
+        ens_w = ens_w / np.sum(ens_w)
+        pred_test = np.zeros_like(top_preds[0]["test_pred"], dtype=float)
+        for w, item in zip(ens_w, top_preds):
+            pred_test += float(w) * item["test_pred"]
+        pred_test = pred_test.reshape(-1, 1)
         y_test_real = y_scaler.inverse_transform(y_test_s)
         test_metrics = evaluate_predictions(y_test_real, pred_test)
 
@@ -619,10 +842,8 @@ def main():
         pred_df = pd.DataFrame(
             {
                 "Event_Date": d_test,
-                "y_true_price_change_t1": y_test_real[:, 0],
-                "y_pred_price_change_t1": pred_test[:, 0],
-                "y_true_stock_change_t1": y_test_real[:, 1],
-                "y_pred_stock_change_t1": pred_test[:, 1],
+                "y_true_price_change_t1": y_test_real.reshape(-1),
+                "y_pred_price_change_t1": pred_test.reshape(-1),
             }
         )
         pred_df.to_csv(out_dir / f"fold_{fold}_predictions.csv", index=False, encoding="utf-8-sig")
@@ -638,14 +859,13 @@ def main():
     folds_df = pd.DataFrame(fold_rows)
     folds_df.to_csv(out_dir / "walkforward_fold_metrics.csv", index=False, encoding="utf-8-sig")
     plot_fold_metrics(out_dir, folds_df)
+    plot_training_overview(out_dir, cfg.n_folds)
+    plot_inventory_price_focus(out_dir, weekly)
     if last_pred_df is not None:
         plot_last_fold_predictions(out_dir, last_pred_df)
-
-    feature_freq = pd.DataFrame(
-        [{"feature": k, "selected_in_folds": v} for k, v in sorted(feature_counter.items(), key=lambda x: (-x[1], x[0]))]
-    )
-    feature_freq.to_csv(out_dir / "feature_selection_frequency.csv", index=False, encoding="utf-8-sig")
-    plot_feature_frequency(out_dir, feature_freq)
+        plot_actual_vs_pred_scatter(out_dir, last_pred_df)
+        plot_residual_distribution(out_dir, last_pred_df)
+        plot_residual_timeseries(out_dir, last_pred_df)
 
     trial_rank = (
         pd.DataFrame(
@@ -656,9 +876,7 @@ def main():
                     "params": json.dumps(x["params"], ensure_ascii=False, sort_keys=True),
                     "selection_score": x["selection_score"],
                     "val_price_mae": x["val_metrics"]["price_change_t1_mae"],
-                    "val_stock_mae": x["val_metrics"]["stock_change_t1_mae"],
                     "test_price_mae": x["test_metrics"]["price_change_t1_mae"],
-                    "test_stock_mae": x["test_metrics"]["stock_change_t1_mae"],
                 }
                 for x in all_trial_logs
             ]
@@ -668,16 +886,16 @@ def main():
             mean_selection_score=("selection_score", "mean"),
             std_selection_score=("selection_score", "std"),
             mean_val_price_mae=("val_price_mae", "mean"),
-            mean_val_stock_mae=("val_stock_mae", "mean"),
             mean_test_price_mae=("test_price_mae", "mean"),
-            mean_test_stock_mae=("test_stock_mae", "mean"),
         )
         .sort_values("mean_selection_score")
         .reset_index(drop=True)
     )
     trial_rank.to_csv(out_dir / "global_trial_ranking.csv", index=False, encoding="utf-8-sig")
     best_global = trial_rank.iloc[0].to_dict()
-    best_global_params = json.loads(best_global["params"])
+    topn = max(1, min(cfg.ensemble_top_n, len(trial_rank)))
+    top_global = trial_rank.head(topn).to_dict(orient="records")
+    best_global_params_list = [json.loads(x["params"]) for x in top_global]
 
     final_pkg_info = export_final_package(
         out_dir=out_dir,
@@ -686,7 +904,7 @@ def main():
         y=y,
         y_dates=y_dates,
         feature_cols=feature_cols,
-        best_params=best_global_params,
+        best_params_list=best_global_params_list,
     )
 
     summary = {
@@ -700,10 +918,6 @@ def main():
                 "price_change_t1_rmse",
                 "price_change_t1_r2",
                 "price_change_t1_direction_acc",
-                "stock_change_t1_mae",
-                "stock_change_t1_rmse",
-                "stock_change_t1_r2",
-                "stock_change_t1_direction_acc",
             ]
         ].mean().to_dict(),
         "fold_metrics_std": folds_df[
@@ -712,22 +926,25 @@ def main():
                 "price_change_t1_rmse",
                 "price_change_t1_r2",
                 "price_change_t1_direction_acc",
-                "stock_change_t1_mae",
-                "stock_change_t1_rmse",
-                "stock_change_t1_r2",
-                "stock_change_t1_direction_acc",
             ]
         ].std().to_dict(),
+        "search_rounds": cfg.search_rounds,
+        "trials_per_round": cfg.trials_per_round,
         "trial_count": len(trial_grid),
+        "ensemble_top_n": cfg.ensemble_top_n,
         "global_best_trial": best_global,
+        "global_top_trials": top_global,
         "final_package": final_pkg_info,
         "process_plots": [
             "process_flow.png",
             "walkforward_splits.png",
             "fold_metrics.png",
+            "training_overview.png",
+            "inventory_price_focus.png",
             "last_fold_predictions.png",
-            "feature_selection_top20.png",
+            "actual_vs_pred_scatter.png",
             "residual_distribution.png",
+            "residual_timeseries.png",
         ],
     }
     with open(out_dir / "walkforward_summary.json", "w", encoding="utf-8") as f:
@@ -739,9 +956,6 @@ def main():
         joblib.dump(last_scalers[1], out_dir / "last_fold_y_scaler.pkl")
         with open(out_dir / "last_fold_feature_columns.json", "w", encoding="utf-8") as f:
             json.dump(last_best_features, f, ensure_ascii=False, indent=2)
-    if last_pred_df is not None:
-        plot_residual_distribution(out_dir, last_pred_df)
-
     print("\nWalk-forward complete.")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     print(f"\nArtifacts saved to: {out_dir}")
